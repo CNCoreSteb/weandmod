@@ -31,6 +31,11 @@ func New() *Store {
 		base = "."
 	}
 	dir := filepath.Join(base, "WeAndMod")
+	return NewAt(dir)
+}
+
+// NewAt 打开指定目录的存储(测试与自定义场景用)。
+func NewAt(dir string) *Store {
 	if os.MkdirAll(dir, 0o755) != nil {
 		dir = "."
 	}

@@ -23,6 +23,9 @@ import (
 	"github.com/CNCoreSteb/weandmod/internal/store"
 )
 
+// autoScan 启动时是否自动扫描(测试里关掉避免后台 goroutine)。
+var autoScan = true
+
 type rowKind int
 
 const (
@@ -45,56 +48,28 @@ type navItem struct {
 	count    int
 }
 
-// navRowObject 侧栏行对象。
-type navRowObject struct {
-	*fyne.Container
-	name  *widget.Label
-	count *widget.Label
-}
-
-func newNavRowObject() *navRowObject {
+// newNavRowObject 侧栏行:Border{ center:Padded(name), right:count }。
+// fyne 渲染树只认 *fyne.Container / fyne.Widget,自定义包装类型不会被遍历,
+// 所以行对象一律用原生容器 + 固定索引访问。
+func newNavRowObject() fyne.CanvasObject {
 	name := widget.NewLabel("")
 	count := widget.NewLabel("")
-	count.TextStyle = fyne.TextStyle{}
-	c := container.NewBorder(nil, nil, nil, count, container.NewPadded(name))
-	return &navRowObject{Container: c, name: name, count: count}
+	return container.NewBorder(nil, nil, nil, count, container.NewPadded(name))
 }
 
-// rowObject 列表行对象:持有全部子部件引用,updateRow 不用挖容器树。
-type rowObject struct {
-	*fyne.Container
-	cover  *coverBox
-	title  *widget.Label
-	sub    *widget.Label
-	action *widget.Button
-}
-
-func newRowObject() *rowObject {
+// newRowObject 主列表行:Border{ center:VBox(title,sub), left:cover, right:Center(action) }。
+// Objects 顺序: [center, left, right]。
+func newRowObject() fyne.CanvasObject {
 	cover := newCoverBox()
 	title := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	sub := widget.NewLabel("")
 	sub.Truncation = fyne.TextTruncateEllipsis
 	action := widget.NewButton("", nil)
-	c := container.NewBorder(nil, nil,
-		cover.container,
+	return container.NewBorder(nil, nil,
+		cover,
 		container.NewCenter(action),
 		container.NewVBox(title, sub),
 	)
-	return &rowObject{Container: c, cover: cover, title: title, sub: sub, action: action}
-}
-
-// sizedContainer 包装容器,把自身 Resize 事件透传给回调
-//(用于窗口尺寸变化时重算自动分页大小)。
-type sizedContainer struct {
-	*fyne.Container
-	onResize func(fyne.Size)
-}
-
-func (s *sizedContainer) Resize(sz fyne.Size) {
-	s.Container.Resize(sz)
-	if s.onResize != nil {
-		s.onResize(sz)
-	}
 }
 
 // Home is the main page: search, library results, trainer hits.
@@ -130,7 +105,7 @@ type Home struct {
 	empty       *widget.Label
 
 	rowMinH    float32 // 单行最小高度(量一次)
-	listHeight float32 // 列表可视高度(resize 回调更新)
+	listHeight float32 // 列表可视高度(布局回调更新)
 }
 
 // NewHome builds the home page and kicks off the initial library scan.
@@ -138,7 +113,9 @@ func NewHome(a fyne.App, w fyne.Window, db *store.Store) *Home {
 	h := &Home{app: a, win: w, db: db}
 	h.games = db.CachedGames()
 	h.build()
-	h.rescan()
+	if autoScan {
+		h.rescan()
+	}
 	return h
 }
 
@@ -182,13 +159,10 @@ func (h *Home) build() {
 	h.empty.Hide()
 
 	// 监听列表容器尺寸 -> 自动分页大小
-	sized := &sizedContainer{
-		Container: container.NewStack(h.list, container.NewCenter(h.empty)),
-	}
-	sized.onResize = func(sz fyne.Size) {
+	sized := newSizedStack(func(sz fyne.Size) {
 		h.listHeight = sz.Height
 		h.scheduleRelayout()
-	}
+	}, h.list, container.NewCenter(h.empty))
 
 	// 左侧游戏库导航(按平台筛选)
 	h.nav = widget.NewList(
@@ -416,54 +390,64 @@ func (h *Home) refresh() {
 	h.list.Refresh()
 }
 
+// rowParts 拆解主列表行 Border 的内部对象(顺序 [center, left, right])。
+func rowParts(c *fyne.Container) (cover, texts, actionBox *fyne.Container) {
+	return c.Objects[1].(*fyne.Container),
+		c.Objects[0].(*fyne.Container),
+		c.Objects[2].(*fyne.Container)
+}
+
 func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 	r := h.rows[i]
-	ro := o.(*rowObject)
+	cover, texts, actionBox := rowParts(o.(*fyne.Container))
+	title := texts.Objects[0].(*widget.Label)
+	sub := texts.Objects[1].(*widget.Label)
+	action := actionBox.Objects[0].(*widget.Button)
 
 	switch r.kind {
 	case rowHeader:
-		ro.cover.container.Hide()
-		ro.sub.Hide()
-		ro.action.Hide()
-		ro.title.TextStyle = fyne.TextStyle{Bold: true}
-		ro.title.SetText(r.header)
+		cover.Hide()
+		sub.Hide()
+		action.Hide()
+		title.TextStyle = fyne.TextStyle{Bold: true}
+		title.SetText(r.header)
 	case rowGame:
-		ro.cover.container.Show()
-		ro.sub.Show()
-		ro.action.Show()
-		ro.action.SetText("找修改器")
-		ro.title.TextStyle = fyne.TextStyle{Bold: true}
-		ro.title.SetText(r.game.Name)
-		ro.sub.SetText(fmt.Sprintf("%s · %s", r.game.Platform, r.game.InstallDir))
+		cover.Show()
+		sub.Show()
+		action.Show()
+		action.SetText("找修改器")
+		title.TextStyle = fyne.TextStyle{Bold: true}
+		title.SetText(r.game.Name)
+		sub.SetText(fmt.Sprintf("%s · %s", r.game.Platform, r.game.InstallDir))
 
-		ro.cover.resetImage()
-		ro.cover.setGame(r.game.Name)
-		loadCover(h.db, *r.game, ro.cover, h.list.Refresh)
+		coverReset(cover)
+		coverPlaceholder(cover, r.game.Name)
+		loadCover(h.db, *r.game, cover, h.list.Refresh)
 
 		g := r.game
-		ro.action.OnTapped = func() {
+		action.OnTapped = func() {
 			h.searchEntry.SetText(g.Name)
 		}
 	case rowTrainer:
-		ro.cover.container.Show()
-		ro.sub.Show()
-		ro.action.Show()
-		ro.action.SetText("打开页面")
-		ro.title.TextStyle = fyne.TextStyle{Bold: false}
-		ro.title.SetText(r.trainer.Title)
-		ro.sub.SetText("来源: " + r.trainer.Provider)
+		cover.Show()
+		sub.Show()
+		action.Show()
+		action.SetText("打开页面")
+		title.TextStyle = fyne.TextStyle{Bold: false}
+		title.SetText(r.trainer.Title)
+		sub.SetText("来源: " + r.trainer.Provider)
 
-		ro.cover.resetImage()
-		ro.cover.setGame(r.trainer.Provider)
+		coverReset(cover)
+		coverPlaceholder(cover, r.trainer.Provider)
 
 		u := r.trainer.PageURL
-		ro.action.OnTapped = func() {
+		action.OnTapped = func() {
 			if parsed, err := url.Parse(u); err == nil {
 				_ = h.app.OpenURL(parsed)
 			}
 		}
 	}
-	ro.title.Refresh()
+	title.Refresh()
 }
 
 // rebuildNav 按当前游戏库重建侧栏导航项(只显示有游戏的平台)。
@@ -500,9 +484,11 @@ func (h *Home) rebuildNav() {
 
 func (h *Home) updateNavRow(i widget.ListItemID, o fyne.CanvasObject) {
 	it := h.navItems[i]
-	no := o.(*navRowObject)
-	no.name.SetText(it.label)
-	no.count.SetText(strconv.Itoa(it.count))
+	c := o.(*fyne.Container)
+	name := c.Objects[0].(*fyne.Container).Objects[0].(*widget.Label) // Padded 包的 name
+	count := c.Objects[1].(*widget.Label)
+	name.SetText(it.label)
+	count.SetText(strconv.Itoa(it.count))
 }
 
 // ---- 设置 ----
