@@ -55,11 +55,17 @@ func (Provider) Search(ctx context.Context, query string) ([]provider.Result, er
 	return out, nil
 }
 
-// hrefRe 抓取所有锚点链接，Resolve 再筛出像下载地址的。
-var hrefRe = regexp.MustCompile(`href="([^"]+)"`)
+// linkRe 抓 <a> 标签的整段属性(1)与 href(2),再筛 class="attachment-link"。
+var (
+	linkRe  = regexp.MustCompile(`<a\b([^>]*?)href="([^"]+)"([^>]*)>`)
+	titleRe = regexp.MustCompile(`title="([^"]*)"`)
+	ampRe   = regexp.MustCompile(`&amp;`)
+)
 
-// Resolve 实现 provider.DownloadResolver：拉取修改器详情页，
-// 选出第一个疑似修改器文件的链接。
+// Resolve 实现 provider.DownloadResolver：拉取修改器详情页,
+// 在附件表中筛 class="attachment-link" 的锚点。
+// 优先最新独立版本(/downloads/<token>,token 随版本变化,更新检测才有意义);
+// 自动更新版(download.php?title_id=,链接恒定)兜底。
 func (Provider) Resolve(ctx context.Context, r provider.Result) (provider.Download, error) {
 	page := r.PageURL
 	if page == "" {
@@ -69,29 +75,76 @@ func (Provider) Resolve(ctx context.Context, r provider.Result) (provider.Downlo
 	if err != nil {
 		return provider.Download{}, err
 	}
-	for _, m := range hrefRe.FindAllSubmatch(body, -1) {
-		u := strings.TrimSpace(string(m[1]))
-		if k, ok := downloadKind(u); ok {
-			return provider.Download{FileURL: u, FileName: path.Base(u), Kind: k}, nil
-		}
-	}
-	return provider.Download{}, errors.New("fling: 未在页面中找到下载链接")
+	return parseDownload(body)
 }
 
-// downloadKind 判断 URL 是否像修改器产物，返回产物类型。
-func downloadKind(u string) (string, bool) {
+// parseDownload 从详情页 HTML 挑选下载链接(纯函数便于测试)。
+// 优先最新独立版本(/downloads/<token>,token 随版本变化,更新检测才有意义);
+// 自动更新版(download.php?title_id=,链接恒定)兜底。
+func parseDownload(body []byte) (provider.Download, error) {
+	type cand struct {
+		href, title string
+		standalone  bool
+	}
+	var cands []cand
+	for _, m := range linkRe.FindAllSubmatch(body, -1) {
+		attrs := string(m[1]) + string(m[3])
+		href := ampRe.ReplaceAllString(string(m[2]), "&")
+		if !strings.Contains(attrs, "attachment-link") && !isDownloadURL(href) {
+			continue
+		}
+		title := ""
+		if tm := titleRe.FindStringSubmatch(attrs); tm != nil {
+			title = tm[1]
+		}
+		cands = append(cands, cand{href, title, strings.Contains(href, "/downloads/")})
+	}
+	if len(cands) == 0 {
+		return provider.Download{}, errors.New("fling: 未在页面中找到下载链接")
+	}
+
+	// 优先第一个独立版本链接(列表按新到旧排,第一条即最新)
+	best := -1
+	for i, c := range cands {
+		if c.standalone {
+			best = i
+			break
+		}
+	}
+	if best < 0 {
+		best = 0 // 只有自动更新版等兜底链接
+	}
+	c := cands[best]
+
+	u := c.href
+	if strings.HasPrefix(u, "/") {
+		u = base + u
+	}
+	name := c.title
+	if name == "" {
+		name = path.Base(u)
+	}
+	return provider.Download{FileURL: u, FileName: name, Kind: kindOf(u)}, nil
+}
+
+// isDownloadURL URL 是否像修改器下载地址。
+func isDownloadURL(u string) bool {
 	l := strings.ToLower(u)
-	// 去掉 query/fragment 再判断后缀
+	return strings.Contains(l, "/downloads/") ||
+		strings.Contains(l, "download.php") ||
+		strings.Contains(l, "/attachment")
+}
+
+// kindOf 从 URL 推断产物类型。
+func kindOf(u string) string {
+	l := strings.ToLower(u)
 	if i := strings.IndexAny(l, "?#"); i >= 0 {
 		l = l[:i]
 	}
 	for _, ext := range []string{".zip", ".rar", ".7z", ".exe"} {
 		if strings.HasSuffix(l, ext) {
-			return ext[1:], true
+			return ext[1:]
 		}
 	}
-	if strings.Contains(l, "/download/") || strings.Contains(l, "/attachment") {
-		return "page", true
-	}
-	return "", false
+	return "file"
 }

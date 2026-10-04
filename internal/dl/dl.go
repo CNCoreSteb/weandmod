@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -146,35 +147,73 @@ func OpenTarget(gameName string) (string, error) {
 
 // ---- 下载 ----
 
-// probeResult 探测结果:文件总大小与 Range 支持情况。
-func probe(ctx context.Context, fileURL string) (total int64, ranges bool, err error) {
+var cdNameRe = regexp.MustCompile(`filename\*?=(?:UTF-8''|")?([^";]+)`)
+
+// cdFileName 从 Content-Disposition 头解析文件名(附件下载的标准做法)。
+func cdFileName(h http.Header) string {
+	cd := h.Get("Content-Disposition")
+	if cd == "" {
+		return ""
+	}
+	m := cdNameRe.FindStringSubmatch(cd)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimSuffix(m[1], `"`))
+}
+
+// sameOriginReferer 部分站点(如 FLiNG)终点要求同源 Referer 才放行。
+func sameOriginReferer(rawurl string) string {
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host + "/"
+}
+
+// setHeaders 统一 UA / Referer;range 非空时带 Range 头。
+func setHeaders(req *http.Request, fileURL, rangeHeader string) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 WeAndMod/0.1")
+	if ref := sameOriginReferer(fileURL); ref != "" {
+		req.Header.Set("Referer", ref)
+	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+}
+
+// probe 探测:文件总大小、Range 支持、服务器文件名、重定向后的最终地址。
+func probe(ctx context.Context, fileURL string) (total int64, ranges bool, cdName, finalURL string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
-		return 0, false, err
+		return 0, false, "", "", err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 WeAndMod/0.1")
-	req.Header.Set("Range", "bytes=0-0")
+	setHeaders(req, fileURL, "bytes=0-0")
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, false, err
+		return 0, false, "", "", err
 	}
 	defer resp.Body.Close()
+	finalURL = resp.Request.URL.String() // 跟随重定向后的真实文件地址
 	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/html") {
-		return 0, false, ErrHTML
+		return 0, false, "", "", ErrHTML
 	}
 	if resp.StatusCode == http.StatusPartialContent {
-		// Content-Range: bytes 0-0/12345
-		cr := resp.Header.Get("Content-Range")
-		if i := strings.LastIndex(cr, "/"); i >= 0 {
-			if n, e := strconv.ParseInt(cr[i+1:], 10, 64); e == nil {
-				return n, true, nil
-			}
-		}
+		total, _ := strconv.ParseInt(contentRangeTotal(resp.Header.Get("Content-Range")), 10, 64)
+		return total, true, cdFileName(resp.Header), finalURL, nil
 	}
 	if resp.StatusCode == http.StatusOK {
-		return resp.ContentLength, false, nil // 不支持 Range,只能单线程
+		return resp.ContentLength, false, cdFileName(resp.Header), finalURL, nil // 不支持 Range,只能单线程
 	}
-	return 0, false, fmt.Errorf("dl: HTTP %d", resp.StatusCode)
+	return 0, false, "", "", fmt.Errorf("dl: HTTP %d", resp.StatusCode)
+}
+
+// contentRangeTotal 解析 Content-Range: bytes 0-0/12345 的总长部分。
+func contentRangeTotal(cr string) string {
+	if i := strings.LastIndex(cr, "/"); i >= 0 {
+		return cr[i+1:]
+	}
+	return ""
 }
 
 // autoThreads 按文件大小自动选线程数:每 4MiB 一个线程,封顶 max。
@@ -208,9 +247,12 @@ func (c *countWriter) Write(p []byte) (int, error) {
 // threads>1 且服务器支持 Range 时自动多线程分块;否则单线程。
 // suggestedName 为空时从 URL 推断;返回落盘后的完整路径。
 func Download(ctx context.Context, key, fileURL, dir, suggestedName string, threads int) (string, error) {
-	total, ranges, err := probe(ctx, fileURL)
+	total, ranges, cdName, finalURL, err := probe(ctx, fileURL)
 	if err != nil {
 		return "", err
+	}
+	if finalURL == "" {
+		finalURL = fileURL
 	}
 	if threads < 1 {
 		threads = 1
@@ -229,24 +271,23 @@ func Download(ctx context.Context, key, fileURL, dir, suggestedName string, thre
 	}
 	name := suggestedName
 	if name == "" {
-		u := fileURL
-		if i := strings.IndexAny(u, "?#"); i >= 0 {
-			u = u[:i]
-		}
-		name = filepath.Base(u)
+		name = cdName // 服务器 Content-Disposition 给的文件名
+	}
+	if name == "" {
+		name = urlBase(finalURL) // 重定向后的最终地址才有真实文件名
 	}
 	name = SanitizeName(name)
 	if filepath.Ext(name) == "" {
-		// 标题命名时没有扩展名:从下载链接后缀补齐(更新检测依赖同名)
-		u := fileURL
-		if i := strings.IndexAny(u, "?#"); i >= 0 {
-			u = u[:i]
-		}
-		if ext := filepath.Ext(filepath.Base(u)); ext != "" && len(ext) <= 6 {
-			name += ext
+		// 标题命名时没有扩展名:依次从最终地址后缀、CD 文件名补齐
+		ext := ""
+		if e := filepath.Ext(urlBase(finalURL)); e != "" && len(e) <= 6 {
+			ext = e
+		} else if e := filepath.Ext(cdName); e != "" && len(e) <= 6 {
+			ext = e
 		} else {
-			name += ".bin"
+			ext = ".bin"
 		}
+		name += ext
 	}
 	dst := filepath.Join(dir, name)
 	tmp := dst + ".part"
@@ -271,13 +312,21 @@ func Download(ctx context.Context, key, fileURL, dir, suggestedName string, thre
 	return dst, os.Rename(tmp, dst)
 }
 
+// urlBase 取 URL 路径末段(去掉 query/fragment)。
+func urlBase(u string) string {
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
+	return filepath.Base(u)
+}
+
 // downloadSingle 单线程流式下载。
 func downloadSingle(ctx context.Context, fileURL, tmp string, tsk *task) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 WeAndMod/0.1")
+	setHeaders(req, fileURL, "")
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -333,8 +382,7 @@ func downloadChunks(ctx context.Context, fileURL, tmp string, total int64, nThre
 				errCh <- err
 				return
 			}
-			req.Header.Set("User-Agent", "Mozilla/5.0 WeAndMod/0.1")
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+			setHeaders(req, fileURL, fmt.Sprintf("bytes=%d-%d", start, end))
 			resp, err := client.Do(req)
 			if err != nil {
 				select {
