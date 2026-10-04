@@ -91,6 +91,53 @@ func TestDownloadSingleNoRange(t *testing.T) {
 	}
 }
 
+// TestDownloadLyingRange 服务器谎报 Range 总大小(报 40 实际 100):
+// 分块下完发现越界还有数据,应回退单线程拿完整文件。
+func TestDownloadLyingRange(t *testing.T) {
+	data := make([]byte, 100)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	const fakeTotal = 40
+	rangeRe := regexp.MustCompile(`bytes=(\d+)-(\d*)`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if m := rangeRe.FindStringSubmatch(r.Header.Get("Range")); m != nil {
+			start, _ := strconv.ParseInt(m[1], 10, 64)
+			end := int64(len(data)) - 1
+			if m[2] != "" {
+				e, _ := strconv.ParseInt(m[2], 10, 64)
+				if e < end {
+					end = e
+				}
+			}
+			// 谎报:content-range 总长永远写 fakeTotal
+			w.Header().Set("Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", start, end, fakeTotal))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[start : end+1])
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(data)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dst, err := Download(context.Background(), "g", srv.URL+"/f.bin", dir, "", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(dst)
+	if len(got) != len(data) {
+		t.Fatalf("expected full %d bytes, got %d", len(data), len(got))
+	}
+	for i := range got {
+		if got[i] != data[i] {
+			t.Fatalf("byte %d mismatch", i)
+		}
+	}
+}
+
 func TestVerify(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string, data []byte) string {

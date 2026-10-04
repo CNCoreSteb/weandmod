@@ -296,6 +296,16 @@ func Download(ctx context.Context, key, fileURL, dir, suggestedName string, thre
 	var derr error
 	if parallel {
 		derr = downloadChunks(ctx, fileURL, tmp, total, nThreads, tsk)
+		if derr == nil {
+			// 有服务器会谎报 Range 总大小(FLiNG 实测:报 1MB 实发 1.8MB),
+			// 越界探测还有数据说明总尺是假的 → 回退单线程
+			if more, e := hasMoreData(ctx, fileURL, total); e == nil && more {
+				tsk.parallel = false
+				tsk.threads = 1
+				tsk.done.Store(0)
+				derr = downloadSingle(ctx, fileURL, tmp, tsk)
+			}
+		}
 		if derr != nil {
 			// 分块失败(服务器中途拒绝 Range 等)回退单线程
 			tsk.parallel = false
@@ -310,12 +320,28 @@ func Download(ctx context.Context, key, fileURL, dir, suggestedName string, thre
 		_ = os.Remove(tmp)
 		return "", derr
 	}
-	// 完整性校验:探测到总长时比对实际写入字节数
-	if total > 0 && tsk.done.Load() != total {
+	// 完整性校验:少于声明总长才算不完整(多则放行——服务器可能报少了)
+	if total > 0 && tsk.done.Load() < total {
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("dl: 文件不完整 %d/%d 字节", tsk.done.Load(), total)
 	}
 	return dst, os.Rename(tmp, dst)
+}
+
+// hasMoreData 探测 claimed 偏移之后是否还有数据:
+// Range bytes=claimed- 返回 206 说明服务器之前报的总大小是假的。
+func hasMoreData(ctx context.Context, fileURL string, claimed int64) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+	if err != nil {
+		return false, err
+	}
+	setHeaders(req, fileURL, fmt.Sprintf("bytes=%d-", claimed))
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusPartialContent, nil
 }
 
 // magics 已知文件头:PE 可执行 / zip / rar / 7z。
