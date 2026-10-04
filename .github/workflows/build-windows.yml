@@ -26,14 +26,19 @@ jobs:
       - name: Verify C toolchain
         run: gcc --version
 
-      - name: Build
+      - name: Resolve version
+        shell: pwsh
         run: |
-          go build -trimpath -ldflags "-H windowsgui -s -w" -o WeAndMod.exe .
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $v = $env:GITHUB_REF -replace '^refs/tags/', ''
+          } else {
+            $v = 'dev-' + $env:GITHUB_SHA.Substring(0, 7)
+          }
+          "APP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Smoke test binary
-        run: |
-          if (-not (Test-Path ./WeAndMod.exe)) { throw "exe missing" }
-          "{0:N1} MB" -f ((Get-Item ./WeAndMod.exe).Length / 1MB)
+      - name: Build
+        shell: pwsh
+        run: ./scripts/build.ps1 -Mode Release -Out WeAndMod.exe -Version $env:APP_VERSION
 
       - uses: actions/upload-artifact@v4
         with:

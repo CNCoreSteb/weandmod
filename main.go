@@ -18,12 +18,15 @@ import (
 //go:embed assets/icon.svg
 var iconSVG []byte
 
+// version 由构建期 -ldflags -X main.version= 注入,默认 dev。
+var version = "dev"
+
 func main() {
 	a := app.NewWithID("io.github.cncoresteb.weandmod")
 	a.Settings().SetTheme(theme.DarkTheme())
 	a.SetIcon(fyne.NewStaticResource("icon.svg", iconSVG))
 
-	w := a.NewWindow("We&Mod")
+	w := a.NewWindow("We&Mod " + version)
 	w.Resize(fyne.NewSize(1180, 760))
 	w.SetMaster()
 
