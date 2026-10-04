@@ -2,11 +2,8 @@ name: Build Windows
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+    tags: ['v*'] # 只在版本 tag 推送时打包发 Release
+  workflow_dispatch: # 保留手动触发(产物为 dev-<sha> 版本)
 
 permissions:
   contents: read
