@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"image/color"
+	"maps"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -18,12 +21,12 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/CNCoreSteb/weandmod/internal/dl"
 	"github.com/CNCoreSteb/weandmod/internal/game"
+	"github.com/CNCoreSteb/weandmod/internal/proc"
 	"github.com/CNCoreSteb/weandmod/internal/provider"
 	"github.com/CNCoreSteb/weandmod/internal/scan"
 	"github.com/CNCoreSteb/weandmod/internal/store"
@@ -63,15 +66,21 @@ func newNavRowObject() fyne.CanvasObject {
 	return container.NewBorder(nil, nil, nil, count, container.NewPadded(name))
 }
 
-// newRowObject 主列表行:Border{ center:VBox(title,sub,dlLine), left:cover, right:Center(action) }。
-// Objects 顺序: [center, left, right]。dlLine 是下载进度行(进度条+文本),默认隐藏。
+// newRowObject 主列表行:Border{ center:VBox(title,subRow,dlLine), left:cover, right:Center(action) }。
+// Objects 顺序: [center, left, right]。subRow = HBox(sub, runMark),runMark 是绿色
+// 「修改器运行中」标记(默认隐藏);dlLine 是下载进度行(进度条+文本),默认隐藏。
 func newRowObject() fyne.CanvasObject {
 	cover := newCoverBox()
 	title := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	sub := widget.NewLabel("")
 	sub.Truncation = fyne.TextTruncateEllipsis
+	runMark := canvas.NewText("", color.NRGBA{R: 0x40, G: 0xc0, B: 0x60, A: 0xff})
+	runMark.TextSize = 11
+	runMark.Hide()
+	subRow := container.NewBorder(nil, nil, nil, runMark, sub)
 	dlBar := widget.NewProgressBar()
-	dlText := widget.NewLabel("")
+	dlText := canvas.NewText("", theme.Color(theme.ColorNameForeground))
+	dlText.TextSize = 11
 	dlLine := container.NewBorder(nil, nil, nil, dlText, dlBar)
 	dlLine.Hide()
 	action := widget.NewButton("", nil)
@@ -80,7 +89,7 @@ func newRowObject() fyne.CanvasObject {
 	return container.NewBorder(nil, nil,
 		cover,
 		container.NewCenter(container.NewVBox(action, action2)),
-		container.NewVBox(title, sub, dlLine),
+		container.NewVBox(title, subRow, dlLine),
 	)
 }
 
@@ -104,6 +113,8 @@ type Home struct {
 
 	resolved  sync.Map // PageURL -> provider.Download(Kind=="page" 表示仅网页可开)
 	resolving sync.Map // PageURL -> bool,在途解析去重
+
+	runningSet atomic.Value // map[string]bool:正在运行的修改器 exe 路径(小写)
 
 	updates []dl.Update // 检测到可更新的已下载修改器
 
@@ -233,6 +244,27 @@ func (h *Home) build() {
 
 	// 启动后后台检查已下载修改器的更新
 	go h.checkUpdates()
+
+	// 进程监控:每 2s 枚举运行中进程,命中已下载修改器时刷新行显示「运行中」
+	go func() {
+		h.runningSet.Store(map[string]bool{})
+		prev := map[string]bool{}
+		for range time.Tick(2 * time.Second) {
+			exes := proc.RunningExes()
+			run := map[string]bool{}
+			for _, p := range dl.AllFiles() {
+				k := strings.ToLower(filepath.Clean(p))
+				if exes[k] {
+					run[k] = true
+				}
+			}
+			if !maps.Equal(run, prev) {
+				prev = run
+				h.runningSet.Store(run)
+				fyne.Do(h.list.Refresh)
+			}
+		}
+	}()
 }
 
 // ---- 数据 ----
@@ -465,10 +497,12 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 	r := h.rows[i]
 	cover, texts, actionBox := rowParts(o.(*fyne.Container))
 	title := texts.Objects[0].(*widget.Label)
-	sub := texts.Objects[1].(*widget.Label)
+	subRow := texts.Objects[1].(*fyne.Container)
+	sub := subRow.Objects[0].(*widget.Label)
+	runMark := subRow.Objects[1].(*canvas.Text)
 	dlLine := texts.Objects[2].(*fyne.Container)
 	dlBar := dlLine.Objects[0].(*widget.ProgressBar)
-	dlText := dlLine.Objects[1].(*widget.Label)
+	dlText := dlLine.Objects[1].(*canvas.Text)
 	btns := actionBox.Objects[0].(*fyne.Container)
 	action := btns.Objects[0].(*widget.Button)
 	action2 := btns.Objects[1].(*widget.Button)
@@ -476,7 +510,7 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 	switch r.kind {
 	case rowHeader:
 		cover.Hide()
-		sub.Hide()
+		subRow.Hide()
 		dlLine.Hide()
 		action.Hide()
 		action2.Hide()
@@ -484,24 +518,37 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 		title.SetText(r.header)
 	case rowGame:
 		cover.Show()
-		sub.Show()
+		subRow.Show()
 		action.Show()
 		action2.Hide()
 		action.Enable() // 行复用:先复位禁用态,下载中/搜索中分支再禁用
 		g := r.game
-		if pr, ok := dl.ProgressOf(g.Name); ok {
-			// 下载中:卡片内显示进度条 + 已下载/总量 + 线程信息
+		pr, downloading := dl.ProgressOf(g.Name)
+		if downloading {
+			// 下载中:进度条 + 已下载/总量 + 线程信息
 			dlLine.Show()
+			dlBar.Show()
 			var frac float64
 			if pr.Total > 0 {
 				frac = float64(pr.Done) / float64(pr.Total)
 			}
 			dlBar.SetValue(frac)
-			dlText.SetText(fmt.Sprintf("%s/%s · %s", humanBytes(pr.Done), humanBytes(pr.Total), threadDesc(pr)))
+			dlText.Text = fmt.Sprintf("%s/%s · %s", humanBytes(pr.Done), humanBytes(pr.Total), threadDesc(pr))
+			dlText.Refresh()
 			action.SetText("下载中")
 			action.Disable()
 		} else {
 			dlLine.Hide()
+		}
+		// 运行中标记放在副标题行内,明确归属本卡片
+		if h.trainerRunning(g.Name) {
+			runMark.Text = "● 修改器运行中"
+			runMark.Show()
+			runMark.Refresh()
+		} else {
+			runMark.Hide()
+		}
+		if !downloading {
 			if dl.HasTrainer(g.Name) {
 				// 已有下载的修改器:按钮变为「打开」
 				action.SetText("打开")
@@ -532,7 +579,8 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 		loadCover(h.db, *g, cover, h.list.Refresh)
 	case rowTrainer:
 		cover.Show()
-		sub.Show()
+		subRow.Show()
+		runMark.Hide()
 		dlLine.Hide()
 		action.Show()
 		action.Enable()
@@ -621,6 +669,21 @@ func (h *Home) prefetchResolve(t *provider.Result) {
 		h.resolved.Store(t.PageURL, d)
 		fyne.Do(h.list.Refresh)
 	}()
+}
+
+// trainerRunning 该游戏目录下的修改器进程是否在运行。
+func (h *Home) trainerRunning(gameName string) bool {
+	v := h.runningSet.Load()
+	if v == nil {
+		return false
+	}
+	set := v.(map[string]bool)
+	for _, f := range dl.Files(gameName) {
+		if set[strings.ToLower(filepath.Clean(f))] {
+			return true
+		}
+	}
+	return false
 }
 
 // trainerPath 返回该搜索结果已下载到本地的文件路径,未下载或文件已删返回 ""。
@@ -792,15 +855,26 @@ func (h *Home) openURL(u string) {
 	}
 }
 
-// openPath 打开本地文件/目录(文件走系统默认关联,exe 即运行)。
+// openPath 打开本地文件/目录:目录进资源管理器,exe/文件用
+// start 拉起(exe 即运行,其他类型走默认关联)。
+// file:// URI 经 OpenURL 在 Windows 上常被路由到浏览器而非运行,故不走它。
 func (h *Home) openPath(p string) {
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return
 	}
-	if parsed, err := url.Parse(storage.NewFileURI(abs).String()); err == nil {
-		_ = h.app.OpenURL(parsed)
+	var cmd *exec.Cmd
+	if fi, _ := os.Stat(abs); fi != nil && fi.IsDir() {
+		cmd = exec.Command("explorer", abs)
+	} else {
+		cmd = exec.Command("cmd", "/c", "start", "", abs)
 	}
+	cmd.Dir = filepath.Dir(abs)
+	go func() {
+		if err := cmd.Start(); err != nil {
+			fyne.Do(func() { h.status.SetText("打开失败: " + err.Error()) })
+		}
+	}()
 }
 
 // rebuildNav 按当前游戏库重建侧栏导航项(只显示有游戏的平台)。

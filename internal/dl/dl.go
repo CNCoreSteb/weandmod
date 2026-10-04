@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -121,7 +122,9 @@ func Files(gameName string) []string {
 	}
 	var out []string
 	for _, e := range ents {
-		if e.IsDir() || strings.HasSuffix(e.Name(), ".part") {
+		// 排除临时文件和旁挂元数据,只算修改器本体
+		if e.IsDir() || strings.HasSuffix(e.Name(), ".part") ||
+			strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
 		out = append(out, filepath.Join(dir, e.Name()))
@@ -131,6 +134,26 @@ func Files(gameName string) []string {
 
 // HasTrainer 该游戏目录下是否已有下载的修改器。
 func HasTrainer(gameName string) bool { return len(Files(gameName)) > 0 }
+
+// AllFiles 列出下载根目录下全部文件(排除元数据/临时文件),供进程监控。
+func AllFiles() []string {
+	root, err := Root()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".json") || strings.HasSuffix(d.Name(), ".part") {
+			return nil
+		}
+		out = append(out, p)
+		return nil
+	})
+	return out
+}
 
 // OpenTarget 游戏行「打开」的目标:仅一个文件时打开文件本身,
 // 否则打开目录。
@@ -258,6 +281,15 @@ func Download(ctx context.Context, key, fileURL, dir, suggestedName string, thre
 	if threads < 1 {
 		threads = 1
 	}
+	// Range 总尺可能造假(FLiNG 实测:Range 响应声称 1MB,普通 GET 实发 1.8MB
+	// 且超出部分直接 416,分块物理上拿不到全量)。
+	// 用无 Range 的普通 GET 的 Content-Length 交叉验证:对不上或没有长度,
+	// 说明 Range 总尺不可信 → 禁用并行,单线程流到 EOF 才是正确大小。
+	if ranges && total > 0 && threads > 1 {
+		if plain := plainLength(ctx, finalURL); plain != total {
+			ranges = false
+		}
+	}
 	parallel := ranges && total > 0 && threads > 1
 	nThreads := 1
 	if parallel {
@@ -296,16 +328,6 @@ func Download(ctx context.Context, key, fileURL, dir, suggestedName string, thre
 	var derr error
 	if parallel {
 		derr = downloadChunks(ctx, fileURL, tmp, total, nThreads, tsk)
-		if derr == nil {
-			// 有服务器会谎报 Range 总大小(FLiNG 实测:报 1MB 实发 1.8MB),
-			// 越界探测还有数据说明总尺是假的 → 回退单线程
-			if more, e := hasMoreData(ctx, fileURL, total); e == nil && more {
-				tsk.parallel = false
-				tsk.threads = 1
-				tsk.done.Store(0)
-				derr = downloadSingle(ctx, fileURL, tmp, tsk)
-			}
-		}
 		if derr != nil {
 			// 分块失败(服务器中途拒绝 Range 等)回退单线程
 			tsk.parallel = false
@@ -328,20 +350,20 @@ func Download(ctx context.Context, key, fileURL, dir, suggestedName string, thre
 	return dst, os.Rename(tmp, dst)
 }
 
-// hasMoreData 探测 claimed 偏移之后是否还有数据:
-// Range bytes=claimed- 返回 206 说明服务器之前报的总大小是假的。
-func hasMoreData(ctx context.Context, fileURL string, claimed int64) (bool, error) {
+// plainLength 无 Range 的 GET 探测 Content-Length(读完即关,不取数据);
+// 服务器流式响应没有长度头时返回 -1。
+func plainLength(ctx context.Context, fileURL string) int64 {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
-		return false, err
+		return -1
 	}
-	setHeaders(req, fileURL, fmt.Sprintf("bytes=%d-", claimed))
+	setHeaders(req, fileURL, "")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, err
+		return -1
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusPartialContent, nil
+	resp.Body.Close() // 立刻关闭,不消耗带宽
+	return resp.ContentLength
 }
 
 // magics 已知文件头:PE 可执行 / zip / rar / 7z。
