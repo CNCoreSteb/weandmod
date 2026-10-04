@@ -6,7 +6,7 @@ on:
   workflow_dispatch: # 保留手动触发(产物为 dev-<sha> 版本)
 
 permissions:
-  contents: read
+  contents: write # 创建 Release 附件需要写权限
 
 jobs:
   build:
