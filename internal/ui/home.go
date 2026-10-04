@@ -15,9 +15,9 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/CNCoreSteb/weandmod/internal/game"
+	"github.com/CNCoreSteb/weandmod/internal/provider"
 	"github.com/CNCoreSteb/weandmod/internal/scan"
 	"github.com/CNCoreSteb/weandmod/internal/store"
-	"github.com/CNCoreSteb/weandmod/internal/trainer"
 )
 
 type rowKind int
@@ -32,7 +32,7 @@ type row struct {
 	kind    rowKind
 	header  string
 	game    *game.Game
-	trainer *trainer.Trainer
+	trainer *provider.Result
 }
 
 // Home is the main page: search, library results, trainer hits.
@@ -42,7 +42,7 @@ type Home struct {
 	db  *store.Store
 
 	games    []game.Game
-	trainers []trainer.Trainer
+	trainers []provider.Result
 	scanning bool
 	query    string
 	rows     []row
@@ -154,12 +154,9 @@ func (h *Home) onQueryChanged(q string) {
 func (h *Home) searchTrainers(q string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	var found []trainer.Trainer
-	for _, src := range trainer.DefaultSources() {
-		got, err := src.Search(ctx, q)
-		if err == nil {
-			found = append(found, got...)
-		}
+	found, err := provider.SearchAll(ctx, q)
+	if err != nil {
+		found = nil
 	}
 	fyne.Do(func() {
 		if h.query != q {
@@ -260,8 +257,8 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 		action.SetText("打开页面")
 		title.TextStyle = fyne.TextStyle{Bold: false}
 		title.SetText(r.trainer.Title)
-		sub.SetText("来源: " + r.trainer.Source)
-		u := r.trainer.URL
+		sub.SetText("来源: " + r.trainer.Provider)
+		u := r.trainer.PageURL
 		action.OnTapped = func() {
 			if parsed, err := url.Parse(u); err == nil {
 				_ = h.app.OpenURL(parsed)

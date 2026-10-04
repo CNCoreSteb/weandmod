@@ -10,6 +10,9 @@ import (
 
 	"github.com/CNCoreSteb/weandmod/internal/store"
 	"github.com/CNCoreSteb/weandmod/internal/ui"
+
+	// trainer provider adapters (blank imports register them)
+	_ "github.com/CNCoreSteb/weandmod/internal/provider/fling"
 )
 
 //go:embed assets/icon.svg
