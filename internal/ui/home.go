@@ -74,9 +74,11 @@ func newRowObject() fyne.CanvasObject {
 	dlLine := container.NewBorder(nil, nil, nil, dlText, dlBar)
 	dlLine.Hide()
 	action := widget.NewButton("", nil)
+	action2 := widget.NewButton("", nil) // 修改器行的「打开页面」
+	action2.Hide()
 	return container.NewBorder(nil, nil,
 		cover,
-		container.NewCenter(action),
+		container.NewCenter(container.NewVBox(action, action2)),
 		container.NewVBox(title, sub, dlLine),
 	)
 }
@@ -97,6 +99,7 @@ type Home struct {
 	navSync  bool // 程序化 Select 时抑制 OnSelected 递归
 
 	searchGame string // 当前修改器搜索归属的游戏名(点「找修改器」时记下)
+	searching  bool   // 修改器搜索进行中(进度动画 + 按钮禁用)
 
 	updates []dl.Update // 检测到可更新的已下载修改器
 
@@ -283,6 +286,16 @@ func (h *Home) onQueryChanged(q string) {
 }
 
 func (h *Home) searchTrainers(q string) {
+	fyne.Do(func() {
+		if h.query != q {
+			return
+		}
+		h.searching = true
+		h.status.SetText("正在搜索修改器…")
+		h.progress.Show()
+		h.progress.Start()
+		h.list.Refresh() // 对应游戏行按钮变「搜索中」
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	found, err := provider.SearchAll(ctx, q)
@@ -290,10 +303,18 @@ func (h *Home) searchTrainers(q string) {
 		found = nil
 	}
 	fyne.Do(func() {
+		h.searching = false
+		h.progress.Stop()
+		h.progress.Hide()
 		if h.query != q {
 			return // 过期结果,丢弃
 		}
 		h.trainers = found
+		if len(found) > 0 {
+			h.status.SetText(fmt.Sprintf("找到 %d 个修改器", len(found)))
+		} else {
+			h.status.SetText("未找到修改器")
+		}
 		h.refresh()
 	})
 }
@@ -444,7 +465,9 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 	dlLine := texts.Objects[2].(*fyne.Container)
 	dlBar := dlLine.Objects[0].(*widget.ProgressBar)
 	dlText := dlLine.Objects[1].(*widget.Label)
-	action := actionBox.Objects[0].(*widget.Button)
+	btns := actionBox.Objects[0].(*fyne.Container)
+	action := btns.Objects[0].(*widget.Button)
+	action2 := btns.Objects[1].(*widget.Button)
 
 	switch r.kind {
 	case rowHeader:
@@ -452,12 +475,15 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 		sub.Hide()
 		dlLine.Hide()
 		action.Hide()
+		action2.Hide()
 		title.TextStyle = fyne.TextStyle{Bold: true}
 		title.SetText(r.header)
 	case rowGame:
 		cover.Show()
 		sub.Show()
 		action.Show()
+		action2.Hide()
+		action.Enable() // 行复用:先复位禁用态,下载中/搜索中分支再禁用
 		g := r.game
 		if pr, ok := dl.ProgressOf(g.Name); ok {
 			// 下载中:卡片内显示进度条 + 已下载/总量 + 线程信息
@@ -480,7 +506,12 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 						h.openPath(p)
 					}
 				}
+			} else if h.searching && h.searchGame == g.Name {
+				// 该游戏的修改器搜索进行中:禁用 + 提示
+				action.SetText("搜索中")
+				action.Disable()
 			} else {
+				action.Enable()
 				action.SetText("找修改器")
 				action.OnTapped = func() {
 					h.searchGame = g.Name // 下载归到该游戏目录
@@ -500,6 +531,7 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 		sub.Show()
 		dlLine.Hide()
 		action.Show()
+		action.Enable()
 		title.TextStyle = fyne.TextStyle{Bold: false}
 		title.SetText(r.trainer.Title)
 		sub.SetText("来源: " + r.trainer.Provider)
@@ -522,6 +554,10 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 			action.SetText("下载")
 			action.OnTapped = func() { h.downloadTrainer(t) }
 		}
+		// 第二按钮:始终可打开原文页
+		action2.Show()
+		action2.SetText("打开页面")
+		action2.OnTapped = func() { h.openURL(t.PageURL) }
 	}
 	title.Refresh()
 }
