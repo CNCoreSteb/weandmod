@@ -1,0 +1,4 @@
+WeAndMod.exe
+*.exe
+*.syso
+/dist/

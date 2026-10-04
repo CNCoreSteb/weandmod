@@ -1,0 +1,50 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify C toolchain
+        run: gcc --version
+
+      - name: Build
+        run: |
+          go build -trimpath -ldflags "-H windowsgui -s -w" -o WeAndMod.exe .
+
+      - name: Smoke test binary
+        run: |
+          if (-not (Test-Path ./WeAndMod.exe)) { throw "exe missing" }
+          "{0:N1} MB" -f ((Get-Item ./WeAndMod.exe).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WeAndMod-windows-amd64
+          path: WeAndMod.exe
+          retention-days: 30
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: WeAndMod.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
