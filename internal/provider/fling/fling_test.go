@@ -17,7 +17,7 @@ const pageHTML = `<div class="download-attachments style-table">
 </tbody></table></div>`
 
 func TestParseDownloadPrefersStandalone(t *testing.T) {
-	d, err := parseDownload([]byte(pageHTML))
+	d, err := parseDownload([]byte(pageHTML), "https://flingtrainer.com/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,17 +30,14 @@ func TestParseDownloadPrefersStandalone(t *testing.T) {
 	}
 }
 
-func TestParseDownloadFallbackAutoupdate(t *testing.T) {
-	// 没有独立版时退回自动更新版
+func TestParseDownloadPageOnly(t *testing.T) {
+	// 只有自动更新版(无独立版)时返回 page 类型,由 UI 只显示打开页面
 	const onlyAuto = `<a href="/download.php?title_id=1&amp;source=x" rel="nofollow" class="attachment-link" title="G.Trainer-FLiNG">x</a>`
-	d, err := parseDownload([]byte(onlyAuto))
+	d, err := parseDownload([]byte(onlyAuto), "https://flingtrainer.com/x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.FileURL != "https://flingtrainer.com/download.php?title_id=1&source=x" {
-		t.Fatalf("file_url = %q", d.FileURL)
-	}
-	if d.FileName != "G.Trainer-FLiNG" {
-		t.Fatalf("file_name = %q", d.FileName)
+	if d.Kind != "page" || d.FileURL != "https://flingtrainer.com/x" {
+		t.Fatalf("expected page-only, got %+v", d)
 	}
 }

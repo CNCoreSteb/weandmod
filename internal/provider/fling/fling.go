@@ -75,13 +75,14 @@ func (Provider) Resolve(ctx context.Context, r provider.Result) (provider.Downlo
 	if err != nil {
 		return provider.Download{}, err
 	}
-	return parseDownload(body)
+	return parseDownload(body, page)
 }
 
 // parseDownload 从详情页 HTML 挑选下载链接(纯函数便于测试)。
-// 优先最新独立版本(/downloads/<token>,token 随版本变化,更新检测才有意义);
-// 自动更新版(download.php?title_id=,链接恒定)兜底。
-func parseDownload(body []byte) (provider.Download, error) {
+// 只接受独立版本(/downloads/<token>,token 随版本变化,更新检测才有意义);
+// 没有独立版(只有 download.php 自动更新版等)时返回 Kind="page",
+// 由调用方回退为打开网页。
+func parseDownload(body []byte, page string) (provider.Download, error) {
 	type cand struct {
 		href, title string
 		standalone  bool
@@ -99,11 +100,8 @@ func parseDownload(body []byte) (provider.Download, error) {
 		}
 		cands = append(cands, cand{href, title, strings.Contains(href, "/downloads/")})
 	}
-	if len(cands) == 0 {
-		return provider.Download{}, errors.New("fling: 未在页面中找到下载链接")
-	}
-
-	// 优先第一个独立版本链接(列表按新到旧排,第一条即最新)
+	// 只接受独立版本(列表按新到旧排,第一条即最新);
+	// 页面连附件表都没有才算解析失败
 	best := -1
 	for i, c := range cands {
 		if c.standalone {
@@ -112,7 +110,10 @@ func parseDownload(body []byte) (provider.Download, error) {
 		}
 	}
 	if best < 0 {
-		best = 0 // 只有自动更新版等兜底链接
+		if len(cands) > 0 {
+			return provider.Download{FileURL: page, Kind: "page"}, nil
+		}
+		return provider.Download{}, errors.New("fling: 未在页面中找到下载链接")
 	}
 	c := cands[best]
 

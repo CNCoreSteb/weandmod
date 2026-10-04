@@ -91,6 +91,37 @@ func TestDownloadSingleNoRange(t *testing.T) {
 	}
 }
 
+func TestVerify(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// 合法 exe / zip 通过
+	if err := Verify(write("a.exe", []byte{'M', 'Z', 1, 2, 3})); err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(write("a.zip", []byte{'P', 'K', 3, 4})); err != nil {
+		t.Fatal(err)
+	}
+	// 伪装成 exe 的 HTML 应被拦截
+	if err := Verify(write("b.exe", []byte("<html>oops"))); err == nil {
+		t.Fatal("html-as-exe should fail")
+	}
+	// 空文件拦截
+	if err := Verify(write("c.zip", nil)); err == nil {
+		t.Fatal("empty should fail")
+	}
+	// 未知类型但非 HTML 放行
+	if err := Verify(write("d.dat", []byte{1, 2, 3, 4})); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProgressTracking(t *testing.T) {
 	if _, ok := ProgressOf("nonexistent"); ok {
 		t.Fatal("phantom progress")

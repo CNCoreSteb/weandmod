@@ -4,6 +4,7 @@
 package dl
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -309,7 +310,68 @@ func Download(ctx context.Context, key, fileURL, dir, suggestedName string, thre
 		_ = os.Remove(tmp)
 		return "", derr
 	}
+	// 完整性校验:探测到总长时比对实际写入字节数
+	if total > 0 && tsk.done.Load() != total {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("dl: 文件不完整 %d/%d 字节", tsk.done.Load(), total)
+	}
 	return dst, os.Rename(tmp, dst)
+}
+
+// magics 已知文件头:PE 可执行 / zip / rar / 7z。
+var magics = [][]byte{
+	{'M', 'Z'},
+	{'P', 'K', 0x03, 0x04}, {'P', 'K', 0x05, 0x06}, // zip(含空包 EOCD)
+	{'R', 'a', 'r', '!'},
+	{'7', 'z', 0xbc, 0xaf, 0x27, 0x1c},
+	{'M', 'S', 'C', 'F'}, // cab
+}
+
+// Verify 校验下载产物:大小非空 + 文件头符合扩展名预期
+// (服务器错误页/截断文件在此拦截)。
+func Verify(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if fi.Size() == 0 {
+		return fmt.Errorf("dl: 文件为空")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	head := make([]byte, 8)
+	n, _ := f.Read(head)
+	head = head[:n]
+
+	ext := strings.ToLower(filepath.Ext(path))
+	// 扩展名明确时按类型校验魔数
+	want := map[string][]byte{
+		".exe": {'M', 'Z'},
+		".zip": {'P', 'K'},
+		".rar": {'R', 'a', 'r', '!'},
+		".7z":  {'7', 'z', 0xbc, 0xaf, 0x27, 0x1c},
+	}
+	if m, ok := want[ext]; ok {
+		if len(head) < len(m) || !bytes.Equal(head[:len(m)], m) {
+			return fmt.Errorf("dl: 文件头与 %s 类型不符(可能下载的是错误页)", ext)
+		}
+		return nil
+	}
+	// 无明确类型:只要不是 HTML/文本就放行
+	if len(head) >= 5 && (bytes.EqualFold(head[:5], []byte("<html")) ||
+		bytes.EqualFold(head[:5], []byte("<!doc")) ||
+		bytes.EqualFold(head[:5], []byte("<?xml"))) {
+		return fmt.Errorf("dl: 下载到的是网页而非文件")
+	}
+	for _, m := range magics {
+		if len(head) >= len(m) && bytes.Equal(head[:len(m)], m) {
+			return nil
+		}
+	}
+	return nil // 未知类型放行
 }
 
 // urlBase 取 URL 路径末段(去掉 query/fragment)。

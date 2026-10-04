@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -100,6 +101,9 @@ type Home struct {
 
 	searchGame string // 当前修改器搜索归属的游戏名(点「找修改器」时记下)
 	searching  bool   // 修改器搜索进行中(进度动画 + 按钮禁用)
+
+	resolved  sync.Map // PageURL -> provider.Download(Kind=="page" 表示仅网页可开)
+	resolving sync.Map // PageURL -> bool,在途解析去重
 
 	updates []dl.Update // 检测到可更新的已下载修改器
 
@@ -544,13 +548,19 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 		if target == "" {
 			target = t.Title
 		}
-		if p := h.trainerPath(t); p != "" {
+		d, resolved := h.trainerDL(t)
+		p := h.trainerPath(t)
+		_, inProgress := dl.ProgressOf(target)
+		switch {
+		case p != "":
 			action.SetText("打开")
 			action.OnTapped = func() { h.openPath(p) }
-		} else if _, ok := dl.ProgressOf(target); ok {
+		case resolved && d.Kind == "page":
+			action.Hide() // 无独立版可下载:只留「打开页面」
+		case inProgress:
 			action.SetText("下载中")
 			action.Disable()
-		} else {
+		default: // 未解析/解析失败/可下载:都显示「下载」,点击时走真实解析
 			action.SetText("下载")
 			action.OnTapped = func() { h.downloadTrainer(t) }
 		}
@@ -585,6 +595,33 @@ func threadDesc(pr dl.Progress) string {
 }
 
 // ---- 修改器下载 ----
+
+// trainerDL 返回该结果的下载解析缓存;未解析时触发后台懒解析并返回 false。
+func (h *Home) trainerDL(t *provider.Result) (provider.Download, bool) {
+	if v, ok := h.resolved.Load(t.PageURL); ok {
+		return v.(provider.Download), true
+	}
+	h.prefetchResolve(t)
+	return provider.Download{}, false
+}
+
+// prefetchResolve 后台解析某结果的下载地址,只跑一次,完成后刷新行。
+func (h *Home) prefetchResolve(t *provider.Result) {
+	if _, loaded := h.resolving.LoadOrStore(t.PageURL, true); loaded {
+		return
+	}
+	go func() {
+		defer h.resolving.Delete(t.PageURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		d, err := provider.Resolve(ctx, *t)
+		if err != nil {
+			d = provider.Download{Kind: "error"} // 标记已尝试,行仍显示下载(点击重试)
+		}
+		h.resolved.Store(t.PageURL, d)
+		fyne.Do(h.list.Refresh)
+	}()
+}
 
 // trainerPath 返回该搜索结果已下载到本地的文件路径,未下载或文件已删返回 ""。
 func (h *Home) trainerPath(t *provider.Result) string {
@@ -631,8 +668,8 @@ func (h *Home) doDownload(t provider.Result, target, oldFile string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		d, err := provider.Resolve(ctx, t)
-		if err != nil || d.FileURL == "" {
-			done("未找到直链,已打开详情页")
+		if err != nil || d.FileURL == "" || d.Kind == "page" {
+			done("无可直链下载的独立版本,已打开详情页")
 			fyne.Do(func() { h.openURL(t.PageURL) })
 			return
 		}
@@ -651,6 +688,15 @@ func (h *Home) doDownload(t provider.Result, target, oldFile string) {
 			} else {
 				done("下载失败: " + err.Error())
 			}
+			return
+		}
+		// 校验产物:文件头/完整性不符视为下载失败
+		if verr := dl.Verify(path); verr != nil {
+			_ = os.Remove(path)
+			done("下载校验失败,文件已删除")
+			fyne.Do(func() {
+				dialog.ShowError(fmt.Errorf("下载的文件校验失败:%w\n可能抓到了错误页或被截断", verr), h.win)
+			})
 			return
 		}
 		// 旁挂元数据:下载链接、链接名称、原文链接
