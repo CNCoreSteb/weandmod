@@ -2,9 +2,12 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"image/color"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,9 +17,11 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/CNCoreSteb/weandmod/internal/dl"
 	"github.com/CNCoreSteb/weandmod/internal/game"
 	"github.com/CNCoreSteb/weandmod/internal/provider"
 	"github.com/CNCoreSteb/weandmod/internal/scan"
@@ -57,18 +62,22 @@ func newNavRowObject() fyne.CanvasObject {
 	return container.NewBorder(nil, nil, nil, count, container.NewPadded(name))
 }
 
-// newRowObject 主列表行:Border{ center:VBox(title,sub), left:cover, right:Center(action) }。
-// Objects 顺序: [center, left, right]。
+// newRowObject 主列表行:Border{ center:VBox(title,sub,dlLine), left:cover, right:Center(action) }。
+// Objects 顺序: [center, left, right]。dlLine 是下载进度行(进度条+文本),默认隐藏。
 func newRowObject() fyne.CanvasObject {
 	cover := newCoverBox()
 	title := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	sub := widget.NewLabel("")
 	sub.Truncation = fyne.TextTruncateEllipsis
+	dlBar := widget.NewProgressBar()
+	dlText := widget.NewLabel("")
+	dlLine := container.NewBorder(nil, nil, nil, dlText, dlBar)
+	dlLine.Hide()
 	action := widget.NewButton("", nil)
 	return container.NewBorder(nil, nil,
 		cover,
 		container.NewCenter(action),
-		container.NewVBox(title, sub),
+		container.NewVBox(title, sub, dlLine),
 	)
 }
 
@@ -87,6 +96,10 @@ type Home struct {
 	navItems []navItem
 	navSync  bool // 程序化 Select 时抑制 OnSelected 递归
 
+	searchGame string // 当前修改器搜索归属的游戏名(点「找修改器」时记下)
+
+	updates []dl.Update // 检测到可更新的已下载修改器
+
 	allRows []row // 过滤后的全部行(分页前)
 	rows    []row // 当前页行
 	page    int
@@ -103,6 +116,7 @@ type Home struct {
 	nextBtn     *widget.Button
 	progress    *widget.ProgressBarInfinite
 	empty       *widget.Label
+	bellDot     *canvas.Circle // 铃铛上的更新红点
 
 	rowMinH    float32 // 单行最小高度(量一次)
 	listHeight float32 // 列表可视高度(布局回调更新)
@@ -127,8 +141,17 @@ func (h *Home) build() {
 	refresh := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), h.rescan)
 	settings := widget.NewButtonWithIcon("", theme.SettingsIcon(), h.showSettings)
 
+	// 左上角铃铛:有修改器更新时显示红点,点击打开更新列表
+	bell := widget.NewButton("🔔", h.showUpdates)
+	h.bellDot = canvas.NewCircle(color.NRGBA{R: 0xe0, G: 0x40, B: 0x40, A: 0xff})
+	h.bellDot.Hide()
+	bellWrap := container.NewStack(bell,
+		container.NewBorder(container.NewHBox(layout.NewSpacer(),
+			container.NewGridWrap(fyne.NewSize(9, 9), h.bellDot)), nil, nil, nil))
+
 	top := container.NewBorder(nil, nil,
-		widget.NewLabelWithStyle("We&Mod", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(bellWrap,
+			widget.NewLabelWithStyle("We&Mod", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})),
 		container.NewHBox(refresh, settings),
 		h.searchEntry,
 	)
@@ -191,6 +214,18 @@ func (h *Home) build() {
 		sized,
 	))
 	h.refresh()
+
+	// 下载进度刷新:有活跃下载时 400ms 刷一次行渲染
+	go func() {
+		for range time.Tick(400 * time.Millisecond) {
+			if dl.HasActive() {
+				fyne.Do(h.list.Refresh)
+			}
+		}
+	}()
+
+	// 启动后后台检查已下载修改器的更新
+	go h.checkUpdates()
 }
 
 // ---- 数据 ----
@@ -228,6 +263,10 @@ func (h *Home) rescan() {
 
 func (h *Home) onQueryChanged(q string) {
 	h.query = strings.TrimSpace(q)
+	// 搜索词被手动改走时,解除与游戏的下载归属
+	if h.searchGame != "" && h.query != h.searchGame {
+		h.searchGame = ""
+	}
 	h.page = 0
 	if h.debounce != nil {
 		h.debounce.Stop()
@@ -402,12 +441,16 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 	cover, texts, actionBox := rowParts(o.(*fyne.Container))
 	title := texts.Objects[0].(*widget.Label)
 	sub := texts.Objects[1].(*widget.Label)
+	dlLine := texts.Objects[2].(*fyne.Container)
+	dlBar := dlLine.Objects[0].(*widget.ProgressBar)
+	dlText := dlLine.Objects[1].(*widget.Label)
 	action := actionBox.Objects[0].(*widget.Button)
 
 	switch r.kind {
 	case rowHeader:
 		cover.Hide()
 		sub.Hide()
+		dlLine.Hide()
 		action.Hide()
 		title.TextStyle = fyne.TextStyle{Bold: true}
 		title.SetText(r.header)
@@ -415,24 +458,48 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 		cover.Show()
 		sub.Show()
 		action.Show()
-		action.SetText("找修改器")
+		g := r.game
+		if pr, ok := dl.ProgressOf(g.Name); ok {
+			// 下载中:卡片内显示进度条 + 已下载/总量 + 线程信息
+			dlLine.Show()
+			var frac float64
+			if pr.Total > 0 {
+				frac = float64(pr.Done) / float64(pr.Total)
+			}
+			dlBar.SetValue(frac)
+			dlText.SetText(fmt.Sprintf("%s/%s · %s", humanBytes(pr.Done), humanBytes(pr.Total), threadDesc(pr)))
+			action.SetText("下载中")
+			action.Disable()
+		} else {
+			dlLine.Hide()
+			if dl.HasTrainer(g.Name) {
+				// 已有下载的修改器:按钮变为「打开」
+				action.SetText("打开")
+				action.OnTapped = func() {
+					if p, err := dl.OpenTarget(g.Name); err == nil {
+						h.openPath(p)
+					}
+				}
+			} else {
+				action.SetText("找修改器")
+				action.OnTapped = func() {
+					h.searchGame = g.Name // 下载归到该游戏目录
+					h.searchEntry.SetText(g.Name)
+				}
+			}
+		}
 		title.TextStyle = fyne.TextStyle{Bold: true}
-		title.SetText(r.game.Name)
-		sub.SetText(fmt.Sprintf("%s · %s", r.game.Platform, r.game.InstallDir))
+		title.SetText(g.Name)
+		sub.SetText(fmt.Sprintf("%s · %s", g.Platform, g.InstallDir))
 
 		coverReset(cover)
-		coverPlaceholder(cover, r.game.Name)
-		loadCover(h.db, *r.game, cover, h.list.Refresh)
-
-		g := r.game
-		action.OnTapped = func() {
-			h.searchEntry.SetText(g.Name)
-		}
+		coverPlaceholder(cover, g.Name)
+		loadCover(h.db, *g, cover, h.list.Refresh)
 	case rowTrainer:
 		cover.Show()
 		sub.Show()
+		dlLine.Hide()
 		action.Show()
-		action.SetText("打开页面")
 		title.TextStyle = fyne.TextStyle{Bold: false}
 		title.SetText(r.trainer.Title)
 		sub.SetText("来源: " + r.trainer.Provider)
@@ -440,14 +507,218 @@ func (h *Home) updateRow(i widget.ListItemID, o fyne.CanvasObject) {
 		coverReset(cover)
 		coverPlaceholder(cover, r.trainer.Provider)
 
-		u := r.trainer.PageURL
-		action.OnTapped = func() {
-			if parsed, err := url.Parse(u); err == nil {
-				_ = h.app.OpenURL(parsed)
-			}
+		t := r.trainer
+		target := h.searchGame
+		if target == "" {
+			target = t.Title
+		}
+		if p := h.trainerPath(t); p != "" {
+			action.SetText("打开")
+			action.OnTapped = func() { h.openPath(p) }
+		} else if _, ok := dl.ProgressOf(target); ok {
+			action.SetText("下载中")
+			action.Disable()
+		} else {
+			action.SetText("下载")
+			action.OnTapped = func() { h.downloadTrainer(t) }
 		}
 	}
 	title.Refresh()
+}
+
+// humanBytes 人类可读字节数。
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// threadDesc 进度文本的线程描述:「多线程×4」或「单线程」。
+func threadDesc(pr dl.Progress) string {
+	if pr.Parallel {
+		return fmt.Sprintf("多线程×%d", pr.Threads)
+	}
+	return "单线程"
+}
+
+// ---- 修改器下载 ----
+
+// trainerPath 返回该搜索结果已下载到本地的文件路径,未下载或文件已删返回 ""。
+func (h *Home) trainerPath(t *provider.Result) string {
+	p, ok := h.db.Settings().Downloads[t.PageURL]
+	if !ok {
+		return ""
+	}
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
+// downloadTrainer 下载一条搜索结果:归属目录优先用「找修改器」记下的游戏名。
+func (h *Home) downloadTrainer(t *provider.Result) {
+	target := h.searchGame
+	if target == "" {
+		target = t.Title
+	}
+	h.doDownload(*t, target, "")
+}
+
+// doDownload 解析直链并下载到 文档\WeAndMod\<target>,文件按文章标题命名,
+// 旁挂 .json 元数据供更新检测。oldFile 非空且落盘名不同则删除旧文件(更新场景)。
+// 解析不出直链或返回网页时回退浏览器打开详情页。
+func (h *Home) doDownload(t provider.Result, target, oldFile string) {
+	dir, err := dl.GameDir(target)
+	if err != nil {
+		h.status.SetText("下载失败: " + err.Error())
+		return
+	}
+	h.status.SetText("正在解析下载地址…")
+	h.progress.Show()
+	h.progress.Start()
+
+	done := func(msg string) {
+		fyne.Do(func() {
+			h.progress.Stop()
+			h.progress.Hide()
+			h.status.SetText(msg)
+		})
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		d, err := provider.Resolve(ctx, t)
+		if err != nil || d.FileURL == "" {
+			done("未找到直链,已打开详情页")
+			fyne.Do(func() { h.openURL(t.PageURL) })
+			return
+		}
+		fyne.Do(func() { h.status.SetText("正在下载 " + t.Title + " …") })
+		// 设置关闭多线程时退化为单线程;开启时按文件大小自动分配
+		threads := 1
+		if h.db.Settings().MultiDL() {
+			threads = 8
+		}
+		// 文件名用文章标题(更新检测依赖同名),扩展名从链接补齐
+		path, err := dl.Download(ctx, target, d.FileURL, dir, t.Title, threads)
+		if err != nil {
+			if errors.Is(err, dl.ErrHTML) {
+				done("资源是网页,已打开详情页")
+				fyne.Do(func() { h.openURL(t.PageURL) })
+			} else {
+				done("下载失败: " + err.Error())
+			}
+			return
+		}
+		// 旁挂元数据:下载链接、链接名称、原文链接
+		_ = dl.WriteMeta(path, dl.Meta{
+			Title:      t.Title,
+			ProviderID: t.ProviderID,
+			PageURL:    t.PageURL,
+			FileURL:    d.FileURL,
+			FileName:   d.FileName,
+		})
+		if oldFile != "" && oldFile != path {
+			_ = os.Remove(oldFile) // 更新后清理旧文件
+		}
+		st := h.db.Settings()
+		if st.Downloads == nil {
+			st.Downloads = map[string]string{}
+		}
+		st.Downloads[t.PageURL] = path
+		_ = h.db.SaveSettings(st)
+		fyne.Do(func() {
+			h.progress.Stop()
+			h.progress.Hide()
+			h.status.SetText("已下载: " + filepath.Base(path))
+			// 下载完成的项从更新列表移除
+			var kept []dl.Update
+			for _, u := range h.updates {
+				if u.Meta.PageURL != t.PageURL {
+					kept = append(kept, u)
+				}
+			}
+			h.updates = kept
+			if len(kept) == 0 {
+				h.bellDot.Hide()
+			}
+			h.refresh() // 游戏行翻转为「打开」
+		})
+	}()
+}
+
+// checkUpdates 后台扫描已下载修改器并检测更新,有则点亮铃铛红点。
+func (h *Home) checkUpdates() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	ups := dl.CheckUpdates(ctx)
+	fyne.Do(func() {
+		h.updates = ups
+		if len(ups) > 0 {
+			h.bellDot.Show()
+		} else {
+			h.bellDot.Hide()
+		}
+	})
+}
+
+// showUpdates 铃铛点击:弹出窗口列出所有可更新的修改器。
+func (h *Home) showUpdates() {
+	if len(h.updates) == 0 {
+		dialog.ShowInformation("修改器更新", "已下载的修改器均为最新", h.win)
+		return
+	}
+	var list *widget.List
+	list = widget.NewList(
+		func() int { return len(h.updates) },
+		func() fyne.CanvasObject {
+			l := widget.NewLabel("")
+			l.Truncation = fyne.TextTruncateEllipsis
+			return container.NewBorder(nil, nil, nil,
+				widget.NewButton("更新", nil), l)
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			u := h.updates[i]
+			c := o.(*fyne.Container)
+			c.Objects[0].(*widget.Label).SetText(u.Game + " — " + u.Meta.Title)
+			btn := c.Objects[1].(*widget.Button)
+			btn.OnTapped = func() {
+				// 重新解析下载到同一游戏目录,旧文件在成功后清理
+				go h.doDownload(provider.Result{
+					ProviderID: u.Meta.ProviderID,
+					PageURL:    u.Meta.PageURL,
+					Title:      u.Meta.Title,
+				}, u.Game, u.FilePath)
+			}
+		},
+	)
+	dialog.ShowCustom("修改器更新", "关闭",
+		container.NewGridWrap(fyne.NewSize(480, 300), list), h.win)
+}
+
+// openURL 浏览器打开链接。
+func (h *Home) openURL(u string) {
+	if parsed, err := url.Parse(u); err == nil {
+		_ = h.app.OpenURL(parsed)
+	}
+}
+
+// openPath 打开本地文件/目录(文件走系统默认关联,exe 即运行)。
+func (h *Home) openPath(p string) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return
+	}
+	if parsed, err := url.Parse(storage.NewFileURI(abs).String()); err == nil {
+		_ = h.app.OpenURL(parsed)
+	}
 }
 
 // rebuildNav 按当前游戏库重建侧栏导航项(只显示有游戏的平台)。
@@ -538,11 +809,19 @@ func (h *Home) showSettings() {
 	// 每页条数选择(0 = 按窗口高度自动)
 	pageSel := widget.NewSelect(pageLabels, nil)
 	pageSel.SetSelectedIndex(indexOfInt(pageValues, st.PageSize))
+	// Steam 匹配:非 Steam 平台游戏用 Steam 商店解析 appid 取封面,默认开
+	steamMatchCheck := widget.NewCheck("非 Steam 游戏用 Steam 匹配封面", nil)
+	steamMatchCheck.Checked = st.SteamMatch()
+	// 多线程下载:默认开,线程数按文件大小自动;关闭后单线程
+	multiDLCheck := widget.NewCheck("多线程下载(线程数自动)", nil)
+	multiDLCheck.Checked = st.MultiDL()
 
 	body := container.NewBorder(
 		container.NewVBox(
 			container.NewBorder(nil, nil, widget.NewLabel("界面缩放"), nil, scaleSel),
 			container.NewBorder(nil, nil, widget.NewLabel("每页条数"), nil, pageSel),
+			steamMatchCheck,
+			multiDLCheck,
 			widget.NewSeparator(),
 			widget.NewLabel("自定义游戏目录(扫描其中的 .exe)"),
 		), nil, nil, nil,
@@ -559,6 +838,10 @@ func (h *Home) showSettings() {
 		st.CustomDirs = dirs
 		st.UIScale = scaleValues[safeIndex(scaleSel.SelectedIndex(), len(scaleValues))]
 		st.PageSize = pageValues[safeIndex(pageSel.SelectedIndex(), len(pageValues))]
+		sm := steamMatchCheck.Checked
+		st.SteamMatchOthers = &sm
+		md := multiDLCheck.Checked
+		st.MultiDownload = &md
 		_ = h.db.SaveSettings(st)
 		applyScale(st.UIScale, h.win)
 		h.refresh()

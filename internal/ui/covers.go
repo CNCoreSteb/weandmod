@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image/color"
 	"io"
@@ -117,30 +118,63 @@ var (
 	coverClient   = &http.Client{Timeout: 12 * time.Second}
 )
 
-// loadCover 异步加载游戏封面:先命中磁盘缓存,没有再走网络下载。
-// url 为空(非 Steam)时不动图片层,保留占位块。
+// errNotFound 资源不存在(404),写入负缓存避免反复请求。
+var errNotFound = fmt.Errorf("not found")
+
+// loadCover 异步加载游戏封面:先命中磁盘缓存,其次 Steam 直链,
+// 非 Steam 平台在开启 Steam 匹配时先解析 appid 再拉封面。
 // onReady 在下载完成后调用(让调用方刷新可见行,命中新缓存)。
 func loadCover(db *store.Store, g game.Game, cover *fyne.Container, onReady func()) {
-	u := coverURL(g)
-	if u == "" {
-		return
-	}
-	_, _, img := coverParts(cover)
-	coverAssigned.Store(img, g.ID)
 	cache := coverPath(db.CoversDir(), g)
 	if _, err := os.Stat(cache); err == nil {
+		_, _, img := coverParts(cover)
 		img.File = cache
 		img.Resource = nil
 		img.Show()
 		img.Refresh()
 		return
 	}
+	miss := cache + ".miss"
+	if _, err := os.Stat(miss); err == nil {
+		return // 已确认无封面
+	}
+
+	u := coverURL(g)
+	needResolve := false
+	if u == "" {
+		if !db.Settings().SteamMatch() {
+			return // 未开启 Steam 匹配,保持占位块
+		}
+		needResolve = true
+	}
+
+	_, _, img := coverParts(cover)
+	coverAssigned.Store(img, g.ID)
 	if _, loaded := coverInflight.LoadOrStore(cache, true); loaded {
 		return // 已在下载;完成后由下一轮列表刷新命中缓存
 	}
 	go func() {
 		defer coverInflight.Delete(cache)
-		if err := downloadCover(u, cache); err != nil {
+		uu := u
+		if needResolve {
+			// 用 Steam 商店搜索把游戏名解析成 appid
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			appid, found, err := resolveSteamAppID(ctx, g.Name)
+			cancel()
+			if err != nil {
+				return // 网络失败,下次再试
+			}
+			if !found {
+				_ = os.WriteFile(miss, nil, 0o644) // 负缓存
+				return
+			}
+			uu = "https://cdn.cloudflare.steamstatic.com/steam/apps/" + appid + "/header.jpg"
+		}
+		err := downloadCover(uu, cache)
+		if err != nil {
+			if errors.Is(err, errNotFound) {
+				_ = os.WriteFile(miss, nil, 0o644)
+			}
 			return // 失败保持占位块
 		}
 		fyne.Do(func() {
@@ -169,6 +203,9 @@ func downloadCover(u, dest string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("cover: HTTP %d", resp.StatusCode)
 	}
