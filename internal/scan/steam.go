@@ -33,20 +33,12 @@ func scanSteam() []game.Game {
 	return games
 }
 
-// steamRoot resolves the Steam install directory from the registry or common paths.
+// steamRoot resolves the Steam install directory; candidates are
+// OS-specific (see steam_windows.go / steam_other.go).
 func steamRoot() string {
-	if p, err := regGetString(regHKCU, `Software\Valve\Steam`, "SteamPath"); err == nil && p != "" {
-		if dirExists(p) {
+	for _, p := range steamRoots() {
+		if p != "" && dirExists(p) {
 			return filepath.Clean(p)
-		}
-	}
-	for _, p := range []string{
-		`C:\Program Files (x86)\Steam`,
-		`C:\Program Files\Steam`,
-		`D:\Steam`,
-	} {
-		if dirExists(p) {
-			return p
 		}
 	}
 	return ""

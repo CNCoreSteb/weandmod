@@ -5,7 +5,10 @@
 ## 功能
 
 - **首页搜索**:输入关键词实时过滤本地游戏库,同时在线搜索修改器站点(当前接入 FLiNG)
-- **游戏库扫描**:Steam(含多库目录)、Epic、GOG 自动检测 + 自定义目录(扫描 .exe)
+- **游戏库扫描**:Steam(含多库目录)、Epic、GOG、Xbox/Game Pass(`XboxGames`)、Battle.net、Ubisoft、EA、Rockstar、Riot、WeGame(`WeGameApps`)+ 自定义目录(扫描 .exe)
+- **游戏封面**:Steam 游戏自动拉取 CDN 封面缓存到本地,其余平台显示字母占位块
+- **高 DPI 适配**:Fyne 自带系统 DPI 跟随;设置里可选手动缩放(75%~200%)
+- **自动分页**:每页条数按窗口高度自动计算(设置里可改固定值),翻页栏在底部
 - **一键找修改器**:每个游戏行内"找修改器"按钮自动带入游戏名搜索
 - **结果直达**:修改器结果"打开页面"跳转到对应下载页
 
@@ -43,7 +46,8 @@ internal/scan/              游戏库扫描(steam/epic/gog/custom + 自写 VDF �
 internal/provider/          修改器提供方插件框架(注册表 + 能力接口 + 聚合)
 internal/provider/fling/    FLiNG 适配器(搜索 + 详情页下载链接解析)
 internal/store/             设置与缓存(%APPDATA%\WeAndMod)
-internal/ui/home.go         首页 UI
+internal/ui/home.go         首页 UI(搜索/列表/分页/设置)
+internal/ui/covers.go       游戏封面加载与占位块
 scripts/                    交互式构建/运行/发版脚本
 ```
 
