@@ -16,7 +16,9 @@
 
 ## 构建与运行(Windows)
 
-需要 Go ≥1.27 和 MinGW gcc(Fyne 依赖 CGO;可用 `winget install BrechtSanders.WinLibs.POSIX.UCRT` 安装)。
+需要 Go ≥1.27.3 和 MinGW gcc(Fyne 依赖 CGO;可用 `winget install BrechtSanders.WinLibs.POSIX.UCRT` 安装)。
+
+Go 1.27.3 是安全构建基线，包含 CVE-2026-111943 等标准库修复；`golang.org/x/image` 同步升级以修复封面解码涉及的 TIFF 漏洞。必须重新构建并分发 exe，仅更新 Go 不会修复已有程序。
 
 `scripts/` 下提供交互式脚本,双击 `.cmd` 或命令行运行 `.ps1` 均可:
 
